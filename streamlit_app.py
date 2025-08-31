@@ -1,5 +1,5 @@
 import streamlit as st
-import onboarder as onboard  # or: import lpg_precheck_pro as onboard
+import onboard as onboard  # or: import lpg_precheck_pro as onboard
 
 st.set_page_config(page_title="LPG Pre-Check", layout="wide")
 
