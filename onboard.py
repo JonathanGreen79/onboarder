@@ -1018,5 +1018,195 @@ def main():
     if again in ("y","yes"):
         print(); main()
 
+# ---------- Streamlit/Programmatic wrapper ----------
+def run_precheck(words: str, generate_pdf: bool = False) -> dict:
+    """
+    Run the full pipeline and return a dict with text for the UI, plus files.
+    Keys:
+      - left_text : multi-line summary for left column
+      - ai_text   : AI commentary for right column
+      - pdf_path  : optional path to generated PDF
+      - map_path  : optional path to map image
+    """
+    words = (words or "").strip().lstrip("/")
+    if words.count(".") != 2 or not all(p.isalpha() for p in words.split(".")):
+        raise ValueError("Invalid what3words format. Expected word.word.word")
+
+    lat, lon = w3w(words)
+    if lat is None or lon is None:
+        raise ValueError("what3words lookup failed")
+
+    # Gather data
+    addr     = reverse_geocode(lat, lon)
+    la_name  = addr.get("local_authority") or addr.get("county") or addr.get("state_district")
+    wind     = open_meteo(lat, lon)
+    slope    = slope_aspect(lat, lon, dx=20.0)
+    osm      = overpass(lat, lon, int(CoP["poi_radius_m"]))
+    feats    = parse_osm(lat, lon, osm)
+    hospital = get_nearest_hospital_osm(lat, lon)
+
+    hospital_line = "n/a"
+    if hospital:
+        hospital_line = f"{hospital['name']} ({hospital['distance_m']/1000:.1f} km)"
+        if hospital.get("phone"):
+            hospital_line += f"  Tel: {hospital['phone']}"
+        feats["d_hospital_m"] = round(hospital["distance_m"], 1)
+
+    appr     = approach_grade(lat, lon, feats.get("nearest_road_line"), N=6)
+    rr       = osrm_ratio(lat, lon)
+    notes    = restriction_notes(feats.get("restrictions", []))
+    surf     = surface_info(feats.get("surfaces", []))
+    flood    = flood_risk(feats, slope, slope.get("elev_m"))
+    risk     = risk_score(feats, wind, slope, appr, rr, notes, surf, flood)
+
+    # Build CoP1 checks (plain text)
+    def _pf(label, actual, req, mode=">="):
+        if actual is None:
+            return f"{label}: Unknown"
+        if mode == ">=":
+            status = "PASS" if actual >= req else "FAIL"
+            cmp = "≥" if actual >= req else "<"
+            return f"{label}: {status} — {actual:.1f} m {cmp} {req:.1f} m"
+        if mode == "not<":
+            status = "FAIL" if actual < req else "OK"
+            cmp = "<" if actual < req else "≥"
+            return f"{label}: {status} — {actual:.1f} m {cmp} {req:.1f} m"
+        return f"{label}: n/a"
+
+    cop_lines = [
+        _pf("Building separation", feats.get("d_building_m"), CoP["to_building_m"], ">="),
+        "Boundary separation: Not assessed",
+        _pf("Ignition proxy (road/footpath)", feats.get("d_road_m"), CoP["to_ignition_m"], ">="),
+        _pf("Drain/manhole", feats.get("d_drain_m"), CoP["to_drain_m"], ">="),
+    ]
+    d_ov = feats.get("d_overhead_m")
+    if d_ov is None:
+        cop_lines.append("Overhead power: Unknown")
+    else:
+        cop_lines.append(_pf("Overhead (no-go band)", d_ov, CoP["overhead_block_m"], "not<"))
+        if d_ov < CoP["overhead_info_m"]:
+            cop_lines.append(f"Overhead (info band): Attention — within {CoP['overhead_info_m']} m (≈ {d_ov:.1f} m)")
+        else:
+            cop_lines.append(f"Overhead (info band): Outside attention band — {d_ov:.1f} m ≥ {CoP['overhead_info_m']} m")
+
+    d_rail = feats.get("d_rail_m")
+    if d_rail is None:
+        cop_lines.append("Railway: None mapped nearby")
+    else:
+        if d_rail < CoP["rail_attention_m"]:
+            cop_lines.append(f"Railway: Attention — {d_rail:.1f} m < {CoP['rail_attention_m']} m")
+        else:
+            cop_lines.append(f"Railway: OK — {d_rail:.1f} m ≥ {CoP['rail_attention_m']} m")
+
+    # Risk breakdown
+    breakdown = [f"+{pts} {msg}" for pts, msg in risk["explain"]][:7]
+    if len(breakdown) < 7:
+        if feats.get("d_building_m") and feats["d_building_m"] >= CoP["to_building_m"]:
+            breakdown.append(f"+0 Adequate building separation ({feats['d_building_m']} m ≥ {CoP['to_building_m']} m)")
+        if feats.get("d_overhead_m") and feats["d_overhead_m"] >= CoP["overhead_info_m"]:
+            breakdown.append(f"+0 Overhead outside attention band ({feats['d_overhead_m']} m ≥ {CoP['overhead_info_m']} m)")
+        if len(breakdown) > 7:
+            breakdown = breakdown[:7]
+
+    # AI sections (with fallback), then tidy
+    ctx = {
+        "words": words, "address": addr, "authority": la_name, "hospital": hospital,
+        "wind": wind, "slope": slope, "features": feats, "approach": appr, "route_ratio": rr,
+        "restrictions": notes, "surfaces": surf, "flood": flood, "risk": risk, "cop": CoP
+    }
+    sections = _tidy_sections(ai_sections(ctx))
+
+    # -------- Assemble left_text (multi-line summary; no ANSI) --------
+    def _fmt_m(v): return f"{v:.1f} m" if isinstance(v, (int, float)) else "n/a"
+    wind_txt  = f"{(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'} ({wind.get('deg') or 'n/a'}°)"
+    slope_txt = f"{slope.get('grade_pct','n/a')}% towards {int(slope.get('aspect_deg') or 0)}°"
+    appr_txt  = f"avg {appr.get('avg_pct','?')}% / max {appr.get('max_pct','?')}%"
+    rr_txt    = f"OSRM route ≈ {rr:.2f}× crow-fly" if rr else "n/a"
+    flood_txt = f"{flood['level']} — {'; '.join(flood['why'])}"
+
+    counts = feats["counts"]
+    left_lines = []
+    # Header lines
+    left_lines.append(f"Location: ///{words}   lat {lat:.6f}, lon {lon:.6f}")
+    al = ", ".join([p for p in [addr.get('road'), addr.get('city'), addr.get('postcode')] if p])
+    if al: left_lines.append(al)
+    if addr.get("display_name"): left_lines.append(addr["display_name"])
+    left_lines.append(f"Local authority: {la_name or 'n/a'}")
+    left_lines.append(f"Nearest Hospital (A&E): {hospital_line}")
+    left_lines.append("")
+    # Metrics
+    left_lines += [
+        f"Wind (10 m): {wind_txt}",
+        f"Local slope: {slope_txt}",
+        f"Approach: {appr_txt}",
+        f"Route sanity: {rr_txt}",
+        f"Flood: {flood_txt}",
+        "",
+        f"Separations (~{int(CoP['poi_radius_m'])} m):",
+        f"  • Building:       {_fmt_m(feats.get('d_building_m'))}",
+        f"  • Road/footpath:  {_fmt_m(feats.get('d_road_m'))}",
+        f"  • Drain/manhole:  {_fmt_m(feats.get('d_drain_m'))}",
+        f"  • Overhead:       {_fmt_m(feats.get('d_overhead_m'))}",
+        f"  • Railway:        {_fmt_m(feats.get('d_rail_m'))}",
+        f"  • Watercourse:    {_fmt_m(feats.get('d_water_m'))}",
+        f"  Land use: {feats.get('land_class', 'n/a')}",
+        "",
+        "Counts:",
+        f"  • Buildings:  {counts['buildings']}",
+        f"  • Roads:      {counts['roads']}",
+        f"  • Drains:     {counts['drains']}",
+        f"  • Manholes:   {counts['manholes']}",
+        f"  • Power:      {counts['power_lines']}/{counts['power_structs']}",
+        f"  • Rail:       {counts['rail_lines']}",
+    ]
+    if notes:
+        left_lines += ["", "Access restrictions:"] + [f"  • {n}" for n in notes]
+
+    # CoP1 section
+    left_lines += ["", "CoP1 separation checks (screening):"] + [f"  • {x}" for x in cop_lines]
+
+    # Risk
+    left_lines += [
+        "",
+        f"Risk score: {risk['score']}/100 → {risk['status']}",
+        "Top factors:",
+        *[f"  • {b}" for b in breakdown],
+    ]
+
+    left_text = "\n".join(left_lines)
+
+    # -------- Assemble ai_text (multi-line) --------
+    ai_text = (
+        "[1] Safety Risk Profile\n" + sections.get("Safety Risk Profile", "").strip() + "\n\n" +
+        "[2] Environmental Considerations\n" + sections.get("Environmental Considerations", "").strip() + "\n\n" +
+        "[3] Access & Logistics\n" + sections.get("Access & Logistics", "").strip() + "\n\n" +
+        "[4] Overall Site Suitability\n" + sections.get("Overall Site Suitability", "").strip()
+    ).rstrip()
+
+    # Files (optional)
+    map_path = save_map_card(words, lat, lon)
+    pdf_path = None
+    if generate_pdf:
+        try:
+            out_pdf = f"precheck_{words.replace('.', '_')}.pdf"
+            pdf_path = pdf_report(
+                words, addr, la_name, hospital_line, lat, lon,
+                wind, slope, appr, rr, flood, feats,
+                cop_lines, risk, breakdown, sections,
+                map_path, out_pdf
+            )
+        except Exception:
+            pdf_path = None
+
+    return {
+        "left_text": left_text,
+        "ai_text": ai_text,
+        "pdf_path": pdf_path,
+        "map_path": map_path,
+        # Optional: return raw pieces if you ever want them in the UI
+        "risk": risk, "features": feats, "address": addr, "hospital": hospital
+    }
+
+
 if __name__=="__main__":
     main()
