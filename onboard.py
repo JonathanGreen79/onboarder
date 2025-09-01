@@ -516,58 +516,112 @@ def make_offline_sections(ctx: Dict) -> Dict[str,str]:
         "maintain signage/controls.")
     return {"Safety Risk Profile":S1,"Environmental Considerations":S2,"Access & Logistics":S3,"Overall Site Suitability":S4}
 
-def ai_sections(context: Dict) -> Dict[str,str]:
-    if not OPENAI_API_KEY: return make_offline_sections(context)
+def ai_sections(context: Dict) -> Dict[str, str]:
+    """
+    Ask the model for four sections and parse them into a dict.
+    If the API call fails, fall back to make_offline_sections(context).
+    """
+    if not OPENAI_API_KEY:
+        return make_offline_sections(context)
+
     prompt = f"""
-You are an LPG siting assessor. Produce FOUR sections labelled exactly:
+You are an LPG siting assessor. Produce FOUR sections ONLY, for this site:
+
 [1] Safety Risk Profile
 [2] Environmental Considerations
 [3] Access & Logistics
 [4] Overall Site Suitability
-Be numeric and site-specific. Do NOT suggest windbreaks. Low wind (<1 m/s) is a stagnation risk.
-25–35 lines total across all sections. Use plain professional prose (no markdown).
+
+Guidance:
+- Be numeric, site-specific, and practical (no textbook content).
+- Use the provided distances, wind, slope, approach grades, route ratio, flood points, land use, and nearest A&E.
+- Note that very low wind (< 1 m/s) means stagnation risk (do NOT suggest windbreaks).
+- Include clear implications + recommended mitigations (signage, access controls, confirm separations to CoP1, drainage measures, etc.).
+- Length target: ~350–500 words total across all sections (roughly 25–35 lines of prose).
+- DO NOT repeat section titles in the body; put all content on lines after each title.
+- Output format MUST be exactly:
+
+[1] Safety Risk Profile
+...body text for section 1 (no heading repeated)...
+[2] Environmental Considerations
+...body text for section 2...
+[3] Access & Logistics
+...body text for section 3...
+[4] Overall Site Suitability
+...body text for section 4...
+
 Context:
 {json.dumps(context, ensure_ascii=False)}
 """.strip()
+
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
-            json={"model":"gpt-4o-mini","temperature":0.25,"max_tokens":800,
-                  "messages":[{"role":"system","content":"You are an LPG safety and logistics assessor."},
-                              {"role":"user","content":prompt}]},
-            timeout=45
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "temperature": 0.2,
+                "max_tokens": 1400,  # ↑ more room
+                "messages": [
+                    {"role": "system", "content": "You are an LPG safety and logistics assessor."},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=60,
         )
-        if r.status_code != 200: return make_offline_sections(context)
+        if r.status_code != 200:
+            return make_offline_sections(context)
+
         text = r.json()["choices"][0]["message"]["content"].strip()
-        sections = {k:"" for k in ["Safety Risk Profile","Environmental Considerations","Access & Logistics","Overall Site Suitability"]}
-        current=None; mapping={"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
-        for line in text.splitlines():
-            t=line.strip()
-            for key,name in mapping.items():
-                if t.startswith(key):
-                    current=name; t=t[len(key):].strip(":- \t"); 
-                    if t: sections[current]+=t+"\n"; break
-            else:
-                if current: sections[current]+=t+"\n"
-        fb=make_offline_sections(context)
+
+        # Parse into four sections
+        sections = {k: "" for k in [
+            "Safety Risk Profile",
+            "Environmental Considerations",
+            "Access & Logistics",
+            "Overall Site Suitability"
+        ]}
+        current = None
+        mapping = {
+            "[1]": "Safety Risk Profile",
+            "[2]": "Environmental Considerations",
+            "[3]": "Access & Logistics",
+            "[4]": "Overall Site Suitability",
+        }
+
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            if not line:
+                if current:
+                    sections[current] += "\n"
+                continue
+
+            started = False
+            for key, name in mapping.items():
+                if line.strip().startswith(key):
+                    current = name
+                    # strip the heading line itself
+                    remainder = line.strip()[len(key):].strip(":-—– \t")
+                    if remainder:
+                        sections[current] += remainder + "\n"
+                    started = True
+                    break
+            if not started and current:
+                sections[current] += line + "\n"
+
+        # Fallback fill if something came out empty
+        fb = make_offline_sections(context)
         for k in sections:
-            if not sections[k].strip(): sections[k]=fb[k]
+            if not sections[k].strip():
+                sections[k] = fb[k]
         return sections
+
     except Exception:
         return make_offline_sections(context)
 
-def _tidy_sections(sections: dict) -> dict:
-    clean={}; labels={"Safety Risk Profile":"1","Environmental Considerations":"2","Access & Logistics":"3","Overall Site Suitability":"4"}
-    for heading, body in sections.items():
-        lines=[ln.rstrip() for ln in (body or "").splitlines()]
-        while lines and not lines[0].strip(): lines.pop(0)
-        if lines:
-            first=lines[0].strip().lower()
-            if first.startswith(heading.lower()) or first.startswith(f"[{labels[heading]}]") or first==labels[heading]:
-                lines=lines[1:]
-        clean[heading]="\n".join(lines).strip()
-    return clean
 
 # ===================== PDF (same as before) =====================
 def pdf_report(words, addr, la_name, hospital_line, lat, lon,
