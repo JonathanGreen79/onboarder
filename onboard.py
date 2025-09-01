@@ -367,7 +367,7 @@ def parse_num(s):
     s=str(s).lower().strip()
     for u in ("m","meter","metre","meters","metres","t","ton","tonne","tonnes"):
         if s.endswith(u): s=s[:-len(u)].strip()
-    try: return float(s.replace(",","."))
+    try: return float(s.replace(",","."))        
     except: return None
 
 def restriction_notes(ways)->List[str]:
@@ -516,7 +516,7 @@ def make_offline_sections(ctx: Dict) -> Dict[str,str]:
         "maintain signage/controls.")
     return {"Safety Risk Profile":S1,"Environmental Considerations":S2,"Access & Logistics":S3,"Overall Site Suitability":S4}
 
-def ai_sections(context: Dict) -> Dict[str, str]:
+def ai_sections(context: Dict) -> Dict[str,str]:
     """
     Ask the model for four sections and parse them into a dict.
     If the API call fails, fall back to make_offline_sections(context).
@@ -557,40 +557,31 @@ Context:
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
             json={
-                "model": "gpt-4o-mini",
-                "temperature": 0.2,
-                "max_tokens": 1400,  # ↑ more room
-                "messages": [
-                    {"role": "system", "content": "You are an LPG safety and logistics assessor."},
-                    {"role": "user", "content": prompt},
+                "model":"gpt-4o-mini",
+                "temperature":0.2,
+                "max_tokens":1400,
+                "messages":[
+                    {"role":"system","content":"You are an LPG safety and logistics assessor."},
+                    {"role":"user","content":prompt}
                 ],
             },
-            timeout=60,
+            timeout=60
         )
         if r.status_code != 200:
             return make_offline_sections(context)
 
         text = r.json()["choices"][0]["message"]["content"].strip()
 
-        # Parse into four sections
-        sections = {k: "" for k in [
+        sections = {k:"" for k in [
             "Safety Risk Profile",
             "Environmental Considerations",
             "Access & Logistics",
             "Overall Site Suitability"
         ]}
-        current = None
-        mapping = {
-            "[1]": "Safety Risk Profile",
-            "[2]": "Environmental Considerations",
-            "[3]": "Access & Logistics",
-            "[4]": "Overall Site Suitability",
-        }
+        current=None
+        mapping={"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
 
         for raw in text.splitlines():
             line = raw.rstrip()
@@ -598,12 +589,10 @@ Context:
                 if current:
                     sections[current] += "\n"
                 continue
-
             started = False
             for key, name in mapping.items():
                 if line.strip().startswith(key):
                     current = name
-                    # strip the heading line itself
                     remainder = line.strip()[len(key):].strip(":-—– \t")
                     if remainder:
                         sections[current] += remainder + "\n"
@@ -612,16 +601,33 @@ Context:
             if not started and current:
                 sections[current] += line + "\n"
 
-        # Fallback fill if something came out empty
-        fb = make_offline_sections(context)
+        # Fallback fill if any empty
+        fb=make_offline_sections(context)
         for k in sections:
             if not sections[k].strip():
-                sections[k] = fb[k]
+                sections[k]=fb[k]
         return sections
-
     except Exception:
         return make_offline_sections(context)
 
+_TITLE_RX = re.compile(
+    r'^\s*(?:#{1,6}\s*)?(?:\[\s*\d+\s*\])?\s*(safety\s*risk\s*profile|environmental\s*considerations|access\s*&\s*logistics|overall\s*site\s*suitability)\s*[:\-–—]*\s*$',
+    flags=re.I
+)
+
+def _tidy_sections(sections: dict) -> dict:
+    """Remove any leading title line from each section body and trim extra blank lines."""
+    clean={}
+    for heading, body in (sections or {}).items():
+        lines=[ln.rstrip() for ln in (body or "").splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines and _TITLE_RX.match(lines[0]):
+            lines = lines[1:]
+            while lines and not lines[0].strip():
+                lines.pop(0)
+        clean[heading]="\n".join(lines).strip()
+    return clean
 
 # ===================== PDF (same as before) =====================
 def pdf_report(words, addr, la_name, hospital_line, lat, lon,
@@ -887,7 +893,6 @@ def console_report(words, addr, la_name, hospital_line, lat, lon, wind, slope, a
         "Access restrictions:\n" + "\n".join(f"• {n}" for n in notes) + "\n"
     ) if notes else ""
 
-
     left_summary = (
         f"Wind (10 m): {wind_txt}\n"
         f"Local slope: {slope_txt}\n"
@@ -1012,207 +1017,6 @@ def main():
     again=input(f"{YEL}Check another location? (y/n): {RST}").strip().lower()
     if again in ("y","yes"):
         print(); main()
-
-# ---------- Web/Streamlit wrapper (non-interactive) ----------
-def run_precheck(words: str, generate_pdf: bool = True, radius_m: int = 400) -> dict:
-    """
-    Run the full pre-check pipeline without prompts/printing and return
-    structured outputs for a web UI.
-
-    Returns a dict containing:
-      - lat, lon
-      - address (dict), la_name (str), hospital_line (str)
-      - wind, slope, approach (appr), route_ratio (rr), flood, features (feats)
-      - cop_lines (list of str), risk (dict), breakdown (list of str)
-      - sections (AI sections; already tidied)
-      - left_text (console-style left column, ANSI removed)
-      - ai_text   (console-style right column, ANSI removed)
-      - pdf_path (str|None), map_path (str|None)
-    """
-    w = words.strip().lstrip("/")
-    if w.count(".") != 2 or not all(p.isalpha() for p in w.split(".")):
-        raise ValueError("Invalid what3words format. Use word.word.word")
-
-    lat, lon = w3w(w)
-    if lat is None or lon is None:
-        raise RuntimeError("what3words lookup failed.")
-
-    # --- lookups (reuse your functions) ---
-    addr     = reverse_geocode(lat, lon)
-    la_name  = addr.get("local_authority") or addr.get("county") or addr.get("state_district")
-    wind     = open_meteo(lat, lon)
-    slope    = slope_aspect(lat, lon, dx=20.0)
-    osm      = overpass(lat, lon, int(CoP["poi_radius_m"]))
-    feats    = parse_osm(lat, lon, osm)
-    hospital = get_nearest_hospital_osm(lat, lon)
-
-    hospital_line = "n/a"
-    if hospital:
-        hospital_line = f"{hospital['name']} ({hospital['distance_m']/1000:.1f} km)"
-        if hospital.get("phone"):
-            hospital_line += f"  Tel: {hospital['phone']}"
-        feats["d_hospital_m"] = round(hospital["distance_m"], 1)
-
-    appr  = approach_grade(lat, lon, feats.get("nearest_road_line"), N=6)
-    rr    = osrm_ratio(lat, lon)
-    notes = restriction_notes(feats.get("restrictions", []))
-    surf  = surface_info(feats.get("surfaces", []))
-    flood = flood_risk(feats, slope, slope.get("elev_m"))
-    risk  = risk_score(feats, wind, slope, appr, rr, notes, surf, flood)
-
-    # --- CoP1 lines (same logic as in main) ---
-    def pf(label, actual, req, mode=">="):
-        if actual is None: return f"{label}: Unknown"
-        if mode == ">=":
-            status = "PASS" if actual >= req else "FAIL"
-            sym = "≥" if actual >= req else "<"
-            return f"{label}: {status} — {actual:.1f} m {sym} {req:.1f} m"
-        if mode == "not<":
-            status = "FAIL" if actual < req else "OK"
-            sym = "<" if actual < req else "≥"
-            return f"{label}: {status} — {actual:.1f} m {sym} {req:.1f} m"
-        return f"{label}: n/a"
-
-    cop_lines = [
-        pf("Building separation", feats.get("d_building_m"), CoP["to_building_m"], ">="),
-        "Boundary separation: Not assessed",
-        pf("Ignition proxy (road/footpath)", feats.get("d_road_m"), CoP["to_ignition_m"], ">="),
-        pf("Drain/manhole", feats.get("d_drain_m"), CoP["to_drain_m"], ">="),
-    ]
-    d_ov = feats.get("d_overhead_m")
-    if d_ov is None:
-        cop_lines.append("Overhead power: Unknown")
-    else:
-        cop_lines.append(pf("Overhead (no-go band)", d_ov, CoP["overhead_block_m"], "not<"))
-        if d_ov < CoP["overhead_info_m"]:
-            cop_lines.append(f"Overhead (info band): Attention — within {CoP['overhead_info_m']} m (≈ {d_ov:.1f} m)")
-        else:
-            cop_lines.append(f"Overhead (info band): Outside attention band — {d_ov:.1f} m ≥ {CoP['overhead_info_m']} m")
-    d_rail = feats.get("d_rail_m")
-    if d_rail is None:
-        cop_lines.append("Railway: None mapped nearby")
-    else:
-        if d_rail < CoP["rail_attention_m"]:
-            cop_lines.append(f"Railway: Attention — {d_rail:.1f} m < {CoP['rail_attention_m']} m")
-        else:
-            cop_lines.append(f"Railway: OK — {d_rail:.1f} m ≥ {CoP['rail_attention_m']} m")
-
-    breakdown = [f"+{pts} {msg}" for pts, msg in risk["explain"]][:7]
-    if len(breakdown) < 7:
-        if feats.get("d_building_m") and feats["d_building_m"] >= CoP["to_building_m"]:
-            breakdown.append(f"+0 Adequate building separation ({feats['d_building_m']} m ≥ {CoP['to_building_m']} m)")
-        if feats.get("d_overhead_m") and feats["d_overhead_m"] >= CoP["overhead_info_m"]:
-            breakdown.append(f"+0 Overhead outside attention band ({feats['d_overhead_m']} m ≥ {CoP['overhead_info_m']} m)")
-        if len(breakdown) > 7:
-            breakdown = breakdown[:7]
-
-    # --- AI sections (tidied) ---
-    ctx = {
-        "words": w, "address": addr, "authority": la_name, "hospital": hospital,
-        "wind": wind, "slope": slope, "features": feats, "approach": appr,
-        "route_ratio": rr, "restrictions": notes, "surfaces": surf,
-        "flood": flood, "risk": risk, "cop": CoP
-    }
-    sections = _tidy_sections(ai_sections(ctx))
-
-    # --- Build the same console-style texts (ANSI removed) ---
-    wind_txt  = f"{(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'} ({wind.get('deg') or 'n/a'}°)"
-    slope_txt = f"{slope.get('grade_pct','n/a')}% towards {int(slope.get('aspect_deg') or 0)}°"
-    appr_txt  = f"avg {appr.get('avg_pct','?')}% / max {appr.get('max_pct','?')}%"
-    rr_txt    = f"OSRM route ≈ {rr:.2f}× crow-fly" if rr else "n/a"
-    flood_txt = f"{flood['level']} — {'; '.join(flood['why'])}"
-
-    def _fmt_m(v): return f"{v:.1f} m" if isinstance(v, (int, float)) else "n/a"
-    sep_lines = [
-        f"•  Building:       {_fmt_m(feats.get('d_building_m'))}",
-        f"•  Road/footpath:  {_fmt_m(feats.get('d_road_m'))}",
-        f"•  Drain/manhole:  {_fmt_m(feats.get('d_drain_m'))}",
-        f"•  Overhead:       {_fmt_m(feats.get('d_overhead_m'))}",
-        f"•  Railway:        {_fmt_m(feats.get('d_rail_m'))}",
-        f"•  Watercourse:    {_fmt_m(feats.get('d_water_m'))}",
-    ]
-    sep_block = f"Separations (~{int(CoP['poi_radius_m'])} m):\n" + "\n".join(sep_lines) + "\n"
-
-    counts = feats["counts"]
-    cnt_lines = [
-        f"• Buildings:  {counts['buildings']}",
-        f"• Roads:      {counts['roads']}",
-        f"• Drains:     {counts['drains']}",
-        f"• Manholes:   {counts['manholes']}",
-        f"• Power:      {counts['power_lines']}/{counts['power_structs']}",
-        f"• Rail:       {counts['rail_lines']}",
-    ]
-    counts_block = "Counts:\n" + "\n".join(cnt_lines) + "\n"
-
-    notes_block = ("Access restrictions:\n" + "\n".join(f"• {n}" for n in notes) + "\n") if notes else ""
-    surface_block = (f"Surface flags: {surf['risky_count']} ({', '.join(surf['samples'])})\n"
-                     if surf.get('risky_count', 0) > 0 else "")
-
-    left_text = (
-        f"Wind (10 m): {wind_txt}\n"
-        f"Local slope: {slope_txt}\n"
-        f"Approach: {appr_txt}\n"
-        f"Route sanity: {rr_txt}\n"
-        f"Flood: {flood_txt}\n\n"
-        + sep_block +
-        f"  Land use: {feats.get('land_class','n/a')}\n"
-        + counts_block
-        + notes_block
-        + surface_block
-        + "\nCoP1 separation checks (screening):\n" + "\n".join(f"• {l}" for l in cop_lines) + "\n"
-        + f"\nRisk score: {risk['score']}/100 → {risk['status']}\n"
-        + "Top factors:\n" + "\n".join("  • " + b for b in breakdown)
-    )
-
-    ai_text = (
-        "[1] Safety Risk Profile\n" + sections.get("Safety Risk Profile", "") + "\n\n" +
-        "[2] Environmental Considerations\n" + sections.get("Environmental Considerations", "") + "\n\n" +
-        "[3] Access & Logistics\n" + sections.get("Access & Logistics", "") + "\n\n" +
-        "[4] Overall Site Suitability\n" + sections.get("Overall Site Suitability", "") + "\n"
-    )
-
-    # --- Map & PDF (to /tmp for Streamlit) ---
-    pdf_path = None
-    map_path = None
-    try:
-        map_path = save_map_card(w, lat, lon)
-        if map_path and not map_path.startswith("/tmp/"):
-            # move to /tmp for streamlit/static serving
-            tmp_path = f"/tmp/{os.path.basename(map_path)}"
-            try:
-                os.replace(map_path, tmp_path)
-                map_path = tmp_path
-            except Exception:
-                pass
-    except Exception:
-        map_path = None
-
-    if generate_pdf and RL_OK:
-        try:
-            out_pdf = f"/tmp/precheck_{w.replace('.','_')}.pdf"
-            _ = pdf_report(
-                words=w, addr=addr, la_name=la_name, hospital_line=hospital_line,
-                lat=lat, lon=lon, wind=wind, slope=slope, appr=appr, rr=rr,
-                flood=flood, feats=feats, cop_report_lines=cop_lines,
-                risk=risk, breakdown_lines=breakdown, sections=sections,
-                map_path=map_path, out_path=out_pdf
-            )
-            pdf_path = out_pdf if os.path.exists(out_pdf) else None
-        except Exception:
-            pdf_path = None
-
-    return {
-        "lat": lat, "lon": lon,
-        "address": addr, "la_name": la_name, "hospital_line": hospital_line,
-        "wind": wind, "slope": slope, "approach": appr, "route_ratio": rr,
-        "flood": flood, "features": feats, "cop_lines": cop_lines,
-        "risk": risk, "breakdown": breakdown, "sections": sections,
-        "left_text": strip_ansi(left_text),
-        "ai_text": strip_ansi(ai_text),
-        "pdf_path": pdf_path,
-        "map_path": map_path,
-    }
-
 
 if __name__=="__main__":
     main()
