@@ -1,65 +1,98 @@
-# streamlit_app.py
-import re
 import streamlit as st
-import onboard as onboard  # or: import lpg_precheck_pro as onboard
+import onboard as onboard  # your backend module with run_precheck()
+
+st.set_page_config(page_title="LPG Pre-Check", layout="wide")
+
 
 # ---------- helpers ----------
-ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-
-def strip_ansi(text: str) -> str:
-    return ANSI_ESCAPE.sub("", text or "")
-
-def prewrap(text: str, *, font_size="0.96rem", line_height="1.5"):
-    """Render text with preserved newlines AND soft-wrapping (no horizontal scroll)."""
+def reflow_paragraphs(text: str) -> str:
+    """
+    Collapse 'soft' line breaks into paragraphs and return a clean, wrapped string.
+    We keep blank lines as paragraph separators.
+    """
     if not text:
-        return
-    safe = strip_ansi(text)
+        return ""
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    paras, buf = [], []
+    for ln in lines:
+        if not ln.strip():
+            if buf:
+                paras.append(" ".join(buf))
+                buf = []
+        else:
+            buf.append(ln.strip())
+    if buf:
+        paras.append(" ".join(buf))
+    return "\n\n".join(paras)
+
+
+def boxed_markdown(md: str):
+    """
+    Render markdown in a pleasant pre-wrapped card.
+    """
     st.markdown(
-        f"""
-        <div style="
-            white-space: pre-wrap;
-            line-height: {line_height};
-            font-size: {font_size};
-            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
-        ">{safe}</div>
+        """
+        <style>
+        .mdbox {
+            padding: 16px;
+            border: 1px solid #e6e6e6;
+            background: #f8fafc;
+            border-radius: 10px;
+            white-space: pre-wrap;      /* wrap newlines */
+            word-wrap: break-word;       /* break long words if needed */
+            font-size: 0.95rem;
+            line-height: 1.45;
+        }
+        .mdbox h4 {
+            margin: 0 0 0.25rem 0;
+            font-size: 1.02rem;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
+    st.markdown(f"<div class='mdbox'>{md}</div>", unsafe_allow_html=True)
 
-# ---------- page ----------
-st.set_page_config(page_title="LPG Pre-Check", layout="wide")
+
+# ---------- UI ----------
 st.title("LPG Customer Tank — Location Intelligence Pre-Check")
 
 words = st.text_input("Enter What3Words location:", "prefer.abandons.confining")
 
 if st.button("Run Pre-Check"):
     try:
-        # This should return a dict like:
-        # {
-        #   "left_text": "...",
-        #   "ai_text": "...",
-        #   "pdf_path": "precheck_xxx.pdf",  # optional
-        #   "map_path": "map_xxx.png",       # optional
-        #   ... other keys
-        # }
         result = onboard.run_precheck(words, generate_pdf=True)
 
-        # Two columns, give AI a bit more space
-        col1, col2 = st.columns([0.9, 1.1])
+        # Left / right columns
+        col1, col2 = st.columns([1, 1.25])
 
+        # LEFT: Summary (use markdown so it wraps nicely)
         with col1:
             st.subheader("Summary")
-            prewrap(result.get("left_text", ""))
+            # the backend returns plain-text; we can show it as a pre-wrapped block
+            boxed_markdown(result.get("left_text", "").replace("  \n", "\n"))
 
+        # RIGHT: AI commentary — reflow to remove soft breaks and format sections
         with col2:
             st.subheader("AI Commentary")
-            prewrap(result.get("ai_text", ""), font_size="0.98rem")
 
-        # Optional map preview
-        if result.get("map_path"):
-            st.image(result["map_path"], caption="Map", use_container_width=True)
+            # If your backend returns a fully formatted ai_text, just reflow it:
+            ai_raw = result.get("ai_text", "")
+            ai_clean = reflow_paragraphs(ai_raw)
 
-        # Optional PDF download
+            # Or, if your backend returns a dict of sections, you could re-compose here:
+            # sections = result.get("ai_sections", {})
+            # ai_clean = "\n\n---\n\n".join(
+            #    f"**[{i}] {title}**\n\n{reflow_paragraphs(body)}"
+            #    for i, title in enumerate(
+            #        ["Safety Risk Profile", "Environmental Considerations",
+            #         "Access & Logistics", "Overall Site Suitability"], 1)
+            #    for body in [sections.get(title, "")]
+            # )
+
+            boxed_markdown(ai_clean)
+
+        # PDF download (if produced)
         if result.get("pdf_path"):
             with open(result["pdf_path"], "rb") as f:
                 st.download_button(
@@ -67,8 +100,11 @@ if st.button("Run Pre-Check"):
                     data=f,
                     file_name=result["pdf_path"].split("/")[-1],
                     mime="application/pdf",
-                    type="secondary",
                 )
+
+        # Map (if produced)
+        if result.get("map_path"):
+            st.image(result["map_path"], caption="Map", use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {e}")

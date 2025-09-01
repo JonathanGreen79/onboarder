@@ -525,20 +525,20 @@ def ai_sections(context: Dict) -> Dict[str,str]:
         return make_offline_sections(context)
 
     prompt = f"""
-You are an LPG siting assessor. Produce FOUR sections ONLY, for this site:
-
+You are an LPG siting assessor. Write a **detailed professional report** with FOUR sections labelled exactly:
 [1] Safety Risk Profile
 [2] Environmental Considerations
 [3] Access & Logistics
 [4] Overall Site Suitability
 
-Guidance:
-- Be numeric, site-specific, and practical (no textbook content).
-- Use the provided distances, wind, slope, approach grades, route ratio, flood points, land use, and nearest A&E.
-- Note that very low wind (< 1 m/s) means stagnation risk (do NOT suggest windbreaks).
-- Include clear implications + recommended mitigations (signage, access controls, confirm separations to CoP1, drainage measures, etc.).
-- Length target: ~350–500 words total across all sections (roughly 25–35 lines of prose).
-- DO NOT repeat section titles in the body; put all content on lines after each title.
+Instructions:
+- Each section must be **5–8 sentences long** (not bullet points).
+- Provide detailed numeric references to distances, slopes, wind, and risk scores from the context.
+- Expand on implications (e.g. logistics challenges, emergency access, environmental impact).
+- Avoid generic filler; all commentary should be **site-specific**.
+- Low wind (<1 m/s) is a stagnation risk. Do NOT suggest windbreaks.
+- Write in plain professional prose (no markdown, no lists).
+- Target length: **at least 35–45 lines total** across all sections.
 - Output format MUST be exactly:
 
 [1] Safety Risk Profile
@@ -560,7 +560,7 @@ Context:
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
             json={
                 "model":"gpt-4o-mini",
-                "temperature":0.2,
+                "temperature":0.25,
                 "max_tokens":1400,
                 "messages":[
                     {"role":"system","content":"You are an LPG safety and logistics assessor."},
